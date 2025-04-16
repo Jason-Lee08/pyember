@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 # Import and re-export core operator implementations
+from .diversity_scorer import DiversityScoringOperator, DiversityScoringOperatorInputs, DiversityScoringOperatorOutputs
 from .ensemble import EnsembleOperator, EnsembleOperatorInputs, EnsembleOperatorOutputs
 from .most_common import (
     MostCommonAnswerSelectorOperator,

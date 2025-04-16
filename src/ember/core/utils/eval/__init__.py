@@ -20,3 +20,8 @@ from .pipeline import (
 )
 from .registry import EvaluatorRegistry
 from .stateful_evaluators import AggregatorEvaluator
+from .diversity_evaluators import (DiversityCompressionEvaluator, 
+                                   DiversityCosineSimilarityEvaluator, 
+                                   DiversityEditDistanceEvaluator,
+                                   DiversityNoveltyEvaluator,
+                                   DiversityEnsembledEvaluator)

@@ -86,12 +86,14 @@ For higher-level usage, prefer the model registry or API interfaces:
 import logging
 from typing import Any, Dict, Optional
 
+import google.genai as genai_new
 import google.generativeai as genai
 from google.api_core.exceptions import NotFound
 from google.generativeai import GenerativeModel, types
 from pydantic import Field, field_validator
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from ember.core.registry.model.base.schemas.model_info import ModelInfo, ProviderInfo
 from ember.core.exceptions import ModelProviderError, ValidationError
 from ember.core.registry.model.base.schemas.chat_schemas import (
     ChatRequest,
@@ -108,6 +110,15 @@ from ember.core.registry.model.providers.base_provider import (
     BaseProviderModel,
 )
 from ember.plugin_system import provider
+from ember.core.registry.model.providers.provider_capability import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    EmbeddingProviderModel,
+    CompletionRequest,
+    CompletionResponse,
+    TextCompletionProviderModel,
+)
+import os
 
 
 class DeepmindProviderParams(ProviderParams):
@@ -529,3 +540,335 @@ class GeminiModel(BaseProviderModel):
             completion_tokens=completion_count,
             cost_usd=total_cost,
         )
+
+@provider("DeepmindExtended")
+class DeepmindExtendedModel(TextCompletionProviderModel, EmbeddingProviderModel):
+    PROVIDER_NAME: str = "DeepmindExtended"
+
+    def create_client(self) -> Any:
+        """Create and configure the Google Generative AI client.
+
+        Configures the google.generativeai SDK using the API key extracted
+        from model_info, and logs available Gemini models for debugging.
+
+        Returns:
+            Any: The configured google.generativeai client.
+
+        Raises:
+            ProviderAPIError: If the API key is missing or invalid.
+        """
+        api_key: Optional[str] = self.model_info.get_api_key()
+        if not api_key:
+            raise ModelProviderError.for_provider(
+                provider_name=self.PROVIDER_NAME,
+                message="Google API key is missing or invalid.",
+            )
+
+        genai.configure(api_key=api_key)
+        logger.info("Listing available Gemini models from Google Generative AI:")
+        try:
+            for model in genai.list_models():
+                logger.info(
+                    "  name=%s | supported=%s",
+                    model.name,
+                    model.supported_generation_methods,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to list Gemini models. Possibly limited or missing permissions: %s",
+                exc,
+            )
+        return genai
+
+    def _normalize_gemini_model_name(self, raw_name: str) -> str:
+        """Normalize the Gemini model name to the expected API format.
+
+        If `raw_name` does not start with the required prefixes ('models/' or 'tunedModels/'),
+        it is prefixed with 'models/'. If the normalized name is not found among the available models,
+        a default model name is used.
+
+        Args:
+            raw_name (str): The input model name.
+
+        Returns:
+            str: A normalized and validated model name.
+        """
+        if not (raw_name.startswith("models/") or raw_name.startswith("tunedModels/")):
+            raw_name = f"models/{raw_name}"
+
+        try:
+            available_models = [m.name for m in genai.list_models()]
+            if raw_name not in available_models:
+                logger.warning(
+                    "Gemini model '%s' not recognized by the API. Using 'models/gemini-1.5-flash'.",
+                    raw_name,
+                )
+                return "models/gemini-1.5-flash"
+        except Exception as exc:
+            logger.warning(
+                "Unable to confirm Gemini model availability. Defaulting to 'models/gemini-1.5-flash'. Error: %s",
+                exc,
+            )
+            return "models/gemini-1.5-flash"
+
+        return raw_name
+
+    @retry(
+        wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3), reraise=True
+    )
+    def forward(self, request: ChatRequest) -> ChatResponse:
+        """Forward a chat request to the Gemini content generation API.
+
+        Converts a universal ChatRequest to Gemini-specific parameters, sends the
+        generation request, and returns a ChatResponse with the generated content and usage stats.
+
+        Args:
+            request (ChatRequest): The chat request containing the prompt and additional parameters.
+
+        Returns:
+            ChatResponse: The response with generated text and usage statistics.
+
+        Raises:
+            InvalidPromptError: If the chat prompt is empty.
+            ProviderAPIError: If the provider returns an error or no content.
+        """
+        if not request.prompt:
+            raise InvalidPromptError.with_context(
+                "Gemini prompt cannot be empty.",
+                provider=self.PROVIDER_NAME,
+                model_name=self.model_info.name,
+            )
+
+        logger.info(
+            "Gemini forward invoked",
+            extra={
+                "provider": self.PROVIDER_NAME,
+                "model_name": self.model_info.name,
+                "prompt_length": len(request.prompt),
+            },
+        )
+
+        final_model_ref: str = self._normalize_gemini_model_name(self.model_info.name)
+
+        # Convert the universal ChatRequest into Gemini-specific parameters.
+        gemini_params: GeminiChatParameters = GeminiChatParameters(
+            **request.model_dump(exclude={"provider_params"})
+        )
+        gemini_kwargs: Dict[str, Any] = gemini_params.to_gemini_kwargs()
+
+        # Merge additional provider parameters if present.
+        if request.provider_params:
+            gemini_kwargs.update(request.provider_params)
+
+        try:
+            generative_model: GenerativeModel = GenerativeModel(final_model_ref)
+            generation_config: types.GenerationConfig = types.GenerationConfig(
+                **gemini_kwargs["generation_config"]
+            )
+            additional_params: Dict[str, Any] = {
+                key: value
+                for key, value in gemini_kwargs.items()
+                if key != "generation_config"
+            }
+
+            # Gemini SDK doesn't accept timeout parameter directly
+            # Extract timeout and remove it from the parameters
+            if additional_params and "timeout" in additional_params:
+                additional_params.pop("timeout", None)
+
+            # Gemini API expects 'contents' parameter, not 'prompt'
+            response = generative_model.generate_content(
+                contents=request.prompt,
+                generation_config=generation_config,
+                **additional_params,
+            )
+            logger.debug(
+                "Gemini usage_metadata from response: %r", response.usage_metadata
+            )
+
+            generated_text: str = response.text
+            if not generated_text:
+                raise ProviderAPIError.for_provider(
+                    provider_name=self.PROVIDER_NAME,
+                    message="Gemini returned no text.",
+                    status_code=None,
+                )
+
+            return ChatResponse(
+                data=generated_text,
+                raw_output=response,
+                usage=self.calculate_usage(raw_output=response),
+            )
+        except NotFound as nf:
+            logger.exception("Gemini model not found or not accessible: %s", nf)
+            raise ProviderAPIError.for_provider(
+                provider_name=self.PROVIDER_NAME,
+                message=f"Model not found or not accessible: {str(nf)}",
+                status_code=404,
+                cause=nf,
+            )
+        except Exception as exc:
+            logger.exception("Error in GeminiModel.forward")
+            raise ProviderAPIError.for_provider(
+                provider_name=self.PROVIDER_NAME,
+                message=f"API error: {str(exc)}",
+                cause=exc,
+            )
+        
+    def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        """Generating embeddings for the input text(s).
+
+        Implements embedding capabilities using the OpenAI embeddings API.
+
+        Args:
+            request: Embedding request with input text(s).
+
+        Returns:
+            Embedding response with vector representations.
+
+        Raises:
+            InvalidPromptError: If input is empty.
+            ProviderAPIError: For unexpected errors during API calls.
+        """
+        # Use the provided model or default to the model in model_info
+        model_name = request.model or self.model_info.name
+
+        input_text = request.input
+        if not input_text:
+            raise InvalidPromptError("Input text for embeddings cannot be empty.")
+
+        logger.info(
+            "DeepmindExtended embeddings invoked",
+            extra={
+                "provider": self.PROVIDER_NAME,
+                "model_name": model_name,
+                "input_type": "batch" if isinstance(input_text, list) else "single",
+            },
+        )
+
+        try:
+            cli = genai_new.Client(api_key=os.environ.get('GEMINI_API_KEY'))
+            # Make the API call
+            response = cli.models.embed_content(
+                model=model_name,
+                contents=request.input,
+                # config=EmbedContentConfig(
+                #     # task_type="RETRIEVAL_DOCUMENT",  # Optional
+                #     # output_dimensionality=768,  # Optional
+                #     # title="Driver's License",  # Optional
+                #     # TODO: implement provider params
+                # ),
+            )
+
+            # Extract embeddings
+            if isinstance(input_text, list):
+                print(f"batch processing")
+                # For batch processing
+                # TODO: UNTESTED --> make sure this works
+                embeddings = [item.values for item in response.embeddings]
+            else:
+                # For single text input
+                embeddings = response.embeddings[0].values
+
+            # Get dimensions from the first embedding
+            if isinstance(embeddings, list) and isinstance(embeddings[0], list):
+                dimensions = len(embeddings[0])
+            else:
+                dimensions = len(embeddings)
+
+            # Calculate usage statistics (implementation would depend on your system)
+            usage_stats = (
+                None  # self.usage_calculator.calculate(response, self.model_info)
+            )
+
+            return EmbeddingResponse(
+                embeddings=embeddings,
+                model=model_name,
+                dimensions=dimensions,
+                raw_output=response,
+                usage=usage_stats,
+            )
+
+        except Exception as exc:
+            logger.exception("Unexpected error in DeepmindExtendedModel.embed()")
+            raise ProviderAPIError(str(exc)) from exc
+
+    def calculate_usage(self, raw_output: Any) -> UsageStats:
+        """Calculate usage statistics from the Gemini API response.
+
+        Parses the usage metadata contained in the raw API response to compute token counts
+        and cost estimations.
+
+        Args:
+            raw_output (Any): The raw response from the Gemini API.
+
+        Returns:
+            UsageStats: An object containing the total tokens used, prompt tokens,
+            completion tokens, and the calculated cost (in USD).
+        """
+        usage_data = getattr(raw_output, "usage_metadata", None)
+        if not usage_data:
+            logger.debug("No usage_metadata found in raw_output.")
+            return UsageStats()
+
+        prompt_count: int = getattr(usage_data, "prompt_token_count", 0)
+        completion_count: int = getattr(usage_data, "candidates_token_count", 0)
+        total_tokens: int = getattr(usage_data, "total_token_count", 0) or (
+            prompt_count + completion_count
+        )
+
+        input_cost: float = (
+            prompt_count / 1000.0
+        ) * self.model_info.cost.input_cost_per_thousand
+        output_cost: float = (
+            completion_count / 1000.0
+        ) * self.model_info.cost.output_cost_per_thousand
+        total_cost: float = round(input_cost + output_cost, 6)
+
+        return UsageStats(
+            total_tokens=total_tokens,
+            prompt_tokens=prompt_count,
+            completion_tokens=completion_count,
+            cost_usd=total_cost,
+        )
+    
+def create_deepmind_embedding_model(model_name: str = "text-embedding-004") -> DeepmindExtendedModel:
+    """
+    Tool for creating an Deepmind embedding model by passing the embedding model name.
+
+    Args:
+        model_name: Name of particular embedding model endpoint as specified by the Deepmind API
+
+    Returns:
+        DeepmindExtendedModel initialized to serve model_name; None if model could not 
+        be created
+
+    Raises:
+        InvalidPromptError: If input is empty.
+        ProviderAPIError: For unexpected errors during API calls.
+    """
+    # All OpenAI embedding models contain "text-embedding" in their model name
+    if "text-embedding" not in model_name:
+        return None
+
+    model_info = ModelInfo(
+        id=f"deepmind:{model_name}",
+        name=model_name,
+        provider=ProviderInfo(
+                    name="DeepmindExtended",
+                    default_api_key=os.environ.get("GOOGLE_API_KEY"),
+                    base_url="https://api.google.com",
+                )
+    )
+
+    embedding_model = DeepmindExtendedModel(model_info)
+
+    return embedding_model
+
+
+if __name__ == "__main__":
+    model = create_deepmind_embedding_model()
+
+    embedding = model.embed_text("hey how are you?")
+
+    print(embedding)
